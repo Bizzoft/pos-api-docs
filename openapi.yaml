@@ -1,0 +1,635 @@
+openapi: 3.0.3
+
+info:
+  title: API de Bizzoft POS
+  version: 1.0.0
+  license:
+    name: Propietaria
+  description: |
+    Acceso programático a Bizzoft POS para integraciones (ERPs, herramientas de BI, robots).
+
+    ## Autenticación
+
+    1. Intercambia tu llave API por un token de acceso con `POST /oauth/token`
+       (flujo OAuth 2.0 *client credentials*).
+    2. Envía el token en todas las demás peticiones: `Authorization: Bearer <access_token>`.
+
+    El token dura 24 horas (`expires_in`). Guárdalo y reutilízalo; solicita uno nuevo poco antes
+    de que expire, o una sola vez después de recibir un `401`. No existe *refresh token*.
+
+    Las llaves API las crea un administrador de tu empresa desde la aplicación web
+    (*Administración → Llaves API*). El `client_secret` se muestra una sola vez.
+
+    ## Convenciones
+
+    - Los nombres de campos están en inglés (camelCase), excepto en `/oauth/token`, que sigue
+      el RFC 6749.
+    - Los campos sin valor se envían como `null`; nunca se omiten.
+    - Los valores codificados (estatus, tipos, métodos de pago, bolsas de inventario) se envían
+      como códigos, para que los programas los comparen. Un campo `...Description` o `...Name`
+      junto a ellos trae el texto que ven las personas.
+    - Las fechas tienen formato `yyyy-MM-dd`. Las fechas con hora tienen formato
+      `yyyy-MM-ddTHH:mm:ss`, tal como se guardan, en la hora local de la empresa
+      (America/Monterrey) y sin desfase de zona horaria.
+    - Los mensajes de error se traducen según `Accept-Language` (`es` o `en`); compara contra
+      los valores de `errorCode` / `fieldError`, nunca contra el texto del mensaje.
+
+servers:
+  - url: https://services.bizzoft.com/microservices
+    description: Producción
+  - url: https://d3bd56kfqrd0eh.cloudfront.net/microservices
+    description: QA
+
+tags:
+  - name: Autenticación
+    description: Obtención de tokens de acceso.
+  - name: Empresa
+    description: Catálogos de la empresa del usuario, usados principalmente para armar los filtros de los reportes.
+  - name: Reportes
+    description: |
+      Reportes como descarga de Excel (por omisión) o como JSON (`format=json`).
+      Requieren el alcance `ROLE_REPORTS` (o `ROLE_ADMIN`).
+
+      **Límite:** 5 peticiones por minuto por llave API, sumando todos los endpoints
+      `/report/*`, sin importar la IP de origen. Al excederlo se responde `429` con el
+      encabezado `Retry-After` (segundos a esperar).
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /oauth/token:
+    post:
+      tags: [Autenticación]
+      operationId: getAccessToken
+      summary: Intercambiar una llave API por un token de acceso
+      description: |
+        Flujo OAuth 2.0 *client credentials* (RFC 6749 §4.4). El cuerpo es **JSON**, no
+        `application/x-www-form-urlencoded`.
+
+        Las credenciales también pueden enviarse con autenticación HTTP Basic
+        (`Authorization: Basic base64(client_id:client_secret)`) y un cuerpo
+        `{"grant_type":"client_credentials"}`. Si vienen en ambos lugares, gana el cuerpo.
+
+        Límites: 30 peticiones por minuto por IP de origen. Varios secretos incorrectos seguidos
+        bloquean la llave por un tiempo. Un cliente bien hecho llama a este endpoint una o dos
+        veces al día.
+      security:
+        - {}
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthTokenRequest'
+            example:
+              grant_type: client_credentials
+              client_id: bzk_live_7fQ2xMv9KpR4sTnW8yLbZa
+              client_secret: bzk_sk_Xq3Rd8LmT5vNc1WpYh6JzKfB2sGe4AuDn7QrMtVxEy0
+      responses:
+        '200':
+          description: Token emitido.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthTokenResponse'
+        '400':
+          description: |
+            `invalid_request` (falta `grant_type`, `client_id` o `client_secret`) o
+            `unsupported_grant_type` (cualquier valor distinto de `client_credentials`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              example:
+                error: unsupported_grant_type
+                error_description: Only client_credentials is supported
+        '401':
+          description: |
+            `invalid_client`: `client_id` desconocido, secreto incorrecto, o llave revocada,
+            expirada o deshabilitada. A propósito se responde lo mismo en todos los casos.
+            No reintentes.
+          headers:
+            WWW-Authenticate:
+              schema: { type: string, example: 'Basic realm="bizzoft-pos"' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              example:
+                error: invalid_client
+                error_description: Client authentication failed
+        '429':
+          description: '`too_many_requests`: se alcanzó el límite de peticiones o la llave está bloqueada temporalmente. Espera antes de reintentar.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+
+  /company/branchOffices:
+    get:
+      tags: [Empresa]
+      operationId: listBranchOffices
+      summary: Listar sucursales
+      description: Sucursales de la empresa del usuario, ordenadas por nombre.
+      parameters:
+        - name: hasInventory
+          in: query
+          description: Solo sucursales que manejan (`true`) o no manejan (`false`) inventario.
+          schema: { type: boolean }
+        - name: active
+          in: query
+          description: Solo sucursales activas (`true`) o inactivas (`false`).
+          schema: { type: boolean }
+        - name: filterByPosUser
+          in: query
+          description: |
+            Solo sucursales con algún POS asignado al usuario. Se ignora para usuarios con
+            `ROLE_ADMIN` o `ROLE_INVENTORY`. Las llaves API no tienen terminales POS asignadas,
+            así que para ellas devuelve una lista vacía; no lo envíes.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Sucursales.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BranchOffice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /company/categories:
+    get:
+      tags: [Empresa]
+      operationId: listCategories
+      summary: Listar categorías de productos
+      description: Categorías de productos de la empresa del usuario, ordenadas por nombre.
+      responses:
+        '200':
+          description: Categorías.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /report/inventory:
+    get:
+      tags: [Reportes]
+      operationId: inventoryReport
+      summary: Reporte de inventario
+      description: |
+        Existencias actuales con **una fila por producto, sucursal y bolsa de inventario**,
+        ordenadas por SKU, código de sucursal y bolsa (la bolsa predeterminada primero).
+
+        Todos los filtros son opcionales; un valor vacío significa "todos".
+
+        **Límite de filas:** una petición que produciría más de 100,000 filas se rechaza con
+        `400` y `globalErrors[0].errorCode = report.rows.exceeded`. Redúcela con
+        `branchOfficeUuid`, `inventoryBagId` o `categoryUuid` (por ejemplo, una petición por
+        sucursal). La validación es un conteo ligero que se ejecuta antes de generar el reporte.
+      x-required-scopes: [ROLE_REPORTS]
+      parameters:
+        - $ref: '#/components/parameters/Format'
+        - name: categoryUuid
+          in: query
+          description: Solo productos de esta categoría (ver `GET /company/categories`).
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          description: Solo productos publicados (activos) o no publicados (inactivos).
+          schema:
+            type: string
+            enum: [published, unpublished]
+        - name: branchOfficeUuid
+          in: query
+          description: Solo esta sucursal (ver `GET /company/branchOffices`).
+          schema: { type: string, format: uuid }
+        - name: inventoryBagId
+          in: query
+          description: |
+            Solo esta bolsa de inventario. Las bolsas disponibles dependen de la empresa; los
+            códigos habituales son `active`, `damaged`, `reserved`, `in_transit` y `missing`.
+          schema: { type: string, example: active }
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: |
+            `format=json`: las filas (un arreglo vacío si nada coincide).
+            `format=xlsx`: un archivo de Excel llamado `inventario_yyyyMMdd_HHmmss.xlsx`.
+          headers:
+            Content-Disposition:
+              description: Solo para xlsx.
+              schema: { type: string, example: 'attachment; filename="inventario_20261004_093000.xlsx"' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InventoryReportRow'
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '204':
+          description: Ninguna fila coincide con los filtros (solo con `format=xlsx`; JSON devuelve `[]`).
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyReportRequests'
+
+  /report/sales:
+    get:
+      tags: [Reportes]
+      operationId: salesReport
+      summary: Reporte de ventas
+      description: |
+        **Una fila por línea de orden de venta**, de la operación más reciente a la más antigua.
+
+        El periodo es obligatorio: uno de los valores predefinidos de `schema`, o `custom` con
+        `customFrom` y `customTo` (ambos inclusivos, con un máximo de 122 días entre ellos).
+      x-required-scopes: [ROLE_REPORTS]
+      parameters:
+        - $ref: '#/components/parameters/Format'
+        - name: schema
+          in: query
+          required: true
+          description: |
+            Periodo del reporte, en la hora local de la empresa:
+            `currentDay` hoy, `currentMonth` el mes calendario en curso, `lastMonth` el mes
+            anterior, `twoMonthsAgo` el mes previo a ese, `custom` el rango
+            `customFrom`..`customTo`.
+          schema:
+            type: string
+            enum: [currentDay, currentMonth, lastMonth, twoMonthsAgo, custom]
+        - name: customFrom
+          in: query
+          description: Primer día, inclusivo. Obligatorio cuando `schema=custom`.
+          schema: { type: string, format: date, example: '2026-09-01' }
+        - name: customTo
+          in: query
+          description: Último día, inclusivo. Obligatorio cuando `schema=custom`; como máximo 122 días después de `customFrom`.
+          schema: { type: string, format: date, example: '2026-09-30' }
+        - name: branchOfficeUuid
+          in: query
+          description: Solo ventas hechas en terminales POS de esta sucursal.
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: |
+            `format=json`: las filas (un arreglo vacío si nada coincide).
+            `format=xlsx`: un archivo de Excel llamado `ventas_yyyyMMdd_HHmmss.xlsx`.
+          headers:
+            Content-Disposition:
+              description: Solo para xlsx.
+              schema: { type: string, example: 'attachment; filename="ventas_20261004_093000.xlsx"' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SalesReportRow'
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '204':
+          description: Ninguna fila coincide con los filtros (solo con `format=xlsx`; JSON devuelve `[]`).
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyReportRequests'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: El `access_token` devuelto por `POST /oauth/token`.
+    basicAuth:
+      type: http
+      scheme: basic
+      description: '`client_id` como usuario y `client_secret` como contraseña. Solo para `POST /oauth/token`.'
+
+  parameters:
+    Format:
+      name: format
+      in: query
+      description: Formato de la respuesta. No distingue mayúsculas de minúsculas.
+      schema:
+        type: string
+        enum: [xlsx, json]
+        default: xlsx
+    AcceptLanguage:
+      name: Accept-Language
+      in: header
+      description: Idioma de los mensajes de error.
+      schema:
+        type: string
+        enum: [es, en]
+        default: es
+
+  responses:
+    Unauthorized:
+      description: |
+        El token está mal formado, expiró o fue revocado. Solicita un token nuevo una sola vez
+        y reintenta; si el reintento también falla, detente y revisa la llave API.
+        El cuerpo es el documento de error genérico del servidor; básate solo en el código HTTP.
+    Forbidden:
+      description: |
+        No se envió el encabezado `Authorization` (el cuerpo es entonces el documento de error
+        genérico del servidor), o la llave API no tiene el alcance que requiere este endpoint
+        (el cuerpo es entonces un `Error` con `errorCode: FORBIDDEN`). No reintentes; envía el
+        token, o pide el alcance a tu administrador.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyReportRequests:
+      description: |
+        Se excedieron las 5 peticiones por minuto de esta llave API a `/report/*`. Espera los
+        segundos que indica `Retry-After` antes de reintentar.
+      headers:
+        Retry-After:
+          description: Segundos que faltan para que se libere el límite.
+          schema: { type: integer, example: 42 }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            errorCode: TOO_MANY_REQUESTS
+            errorMessage: 'Demasiadas solicitudes de reportes: máximo 5 por minuto. Intenta de nuevo en 42 segundos'
+    ValidationFailed:
+      description: |
+        La petición fue rechazada. Los problemas de un parámetro vienen en `fieldErrors` (por
+        ejemplo un `format` desconocido, falta `customFrom`, un rango mayor a 122 días); los
+        problemas de la petición completa vienen en `globalErrors` (por ejemplo
+        `report.rows.exceeded`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationErrors'
+          examples:
+            rowLimit:
+              summary: Demasiadas filas (inventario)
+              value:
+                globalErrors:
+                  - errorCode: report.rows.exceeded
+                    errorMessage: El reporte tendría 1.520.630 filas y el máximo permitido es 100.000. Filtra por sucursal, bolsa de inventario o categoría para reducirlo
+                fieldErrors: []
+            invalidFormat:
+              summary: Formato desconocido
+              value:
+                globalErrors: []
+                fieldErrors:
+                  - fieldError: format
+                    rejectedvalue: pdf
+                    errorCode: field.invalid
+                    errorMessage: Valor inválido
+
+  schemas:
+
+    OAuthTokenRequest:
+      type: object
+      required: [grant_type]
+      properties:
+        grant_type:
+          type: string
+          enum: [client_credentials]
+        client_id:
+          type: string
+          description: Empieza con `bzk_live_` en producción y con `bzk_test_` en los demás ambientes. Obligatorio salvo que se envíe con autenticación Basic.
+        client_secret:
+          type: string
+          format: password
+          description: Empieza con `bzk_sk_`. Obligatorio salvo que se envíe con autenticación Basic.
+
+    OAuthTokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: 'JWT que se envía como `Authorization: Bearer <access_token>`. Trátalo como un valor opaco.'
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Vigencia en segundos.
+          example: 86400
+        scope:
+          type: string
+          description: Permisos otorgados a la llave, separados por espacios.
+          example: ROLE_REPORTS ROLE_USER
+
+    OAuthError:
+      type: object
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, unsupported_grant_type, invalid_client, too_many_requests]
+        error_description:
+          type: string
+
+    Error:
+      type: object
+      properties:
+        errorCode:
+          type: string
+          example: FORBIDDEN
+        errorMessage:
+          type: string
+
+    ValidationErrors:
+      type: object
+      properties:
+        globalErrors:
+          type: array
+          items:
+            $ref: '#/components/schemas/Error'
+        fieldErrors:
+          type: array
+          items:
+            type: object
+            properties:
+              fieldError:
+                type: string
+                description: Nombre del parámetro de la petición.
+              rejectedvalue:
+                type: string
+                nullable: true
+                description: El valor que fue rechazado.
+              errorCode:
+                type: string
+              errorMessage:
+                type: string
+
+    CatalogValue:
+      type: object
+      properties:
+        catalogId:
+          type: string
+          description: Código.
+          example: store
+        description:
+          type: string
+          example: Tienda
+
+    Location:
+      type: object
+      description: Dirección. Cualquier campo puede ser `null`.
+      properties:
+        street: { type: string, nullable: true }
+        number: { type: string, nullable: true }
+        references: { type: string, nullable: true }
+        description: { type: string, nullable: true, description: Dirección completa en una sola línea. }
+        districtName: { type: string, nullable: true }
+        postalCode: { type: string, nullable: true }
+        cityName: { type: string, nullable: true }
+        stateName: { type: string, nullable: true }
+        countryCode: { type: string, nullable: true, example: MX }
+        geoLat: { type: number, nullable: true }
+        geoLng: { type: number, nullable: true }
+        placeId: { type: string, nullable: true, description: Identificador del lugar en Google Maps. }
+
+    BranchOffice:
+      type: object
+      properties:
+        branchOfficeUuid: { type: string, format: uuid }
+        code: { type: string, example: VAS }
+        name: { type: string, example: Vasconcelos }
+        officeType:
+          $ref: '#/components/schemas/CatalogValue'
+        main: { type: boolean }
+        inventory:
+          type: boolean
+          description: Indica si la sucursal maneja su propio inventario.
+        inventoryOnlineSale: { type: boolean }
+        active: { type: boolean }
+        email: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        location:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Location'
+
+    Category:
+      type: object
+      properties:
+        categoryUuid: { type: string, format: uuid }
+        name: { type: string, example: Otros }
+
+    InventoryReportRow:
+      type: object
+      description: Existencia de un producto en una bolsa de inventario de una sucursal.
+      properties:
+        productUuid: { type: string, format: uuid }
+        sku: { type: string }
+        skuSupplier: { type: string, nullable: true }
+        productName: { type: string }
+        productType:
+          type: string
+          enum: [product, service]
+        status:
+          type: string
+          enum: [published, unpublished]
+        categoryUuid: { type: string, format: uuid }
+        categoryName: { type: string }
+        branchOfficeUuid: { type: string, format: uuid }
+        branchOfficeCode: { type: string }
+        branchOfficeName: { type: string }
+        inventoryBagId:
+          type: string
+          example: active
+        inventoryBagName:
+          type: string
+          example: Activos
+        variablePrice: { type: boolean }
+        salePrice: { type: number, nullable: true }
+        fixedDiscount: { type: number, nullable: true }
+        unitName: { type: string, example: Pieza }
+        unitAbbr: { type: string, example: pza(s) }
+        weight: { type: number, nullable: true }
+        lotExpiryDate: { type: string, format: date, nullable: true }
+        qty:
+          type: number
+          description: Cantidad actual en esta bolsa. Puede ser negativa.
+        purchasePriceDefault: { type: number, nullable: true }
+        inventoryValue:
+          type: number
+          nullable: true
+          description: '`qty × purchasePriceDefault`, redondeado a 2 decimales; `0` si es negativo, `null` si el producto no tiene precio de compra.'
+
+    SalesReportRow:
+      type: object
+      description: Una línea de una orden de venta.
+      properties:
+        code:
+          type: string
+          description: Código de la orden de venta.
+        status:
+          type: string
+          enum: [so_paid, so_unpaid, so_canceled, so_devolution]
+        statusDescription: { type: string, example: Pagado }
+        realDatetime:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+          description: Momento de la venta, en hora local de la empresa, sin desfase de zona horaria.
+          example: '2026-09-26T20:38:21'
+        userName:
+          type: string
+          description: Usuario (login) que hizo la venta.
+        userFullName: { type: string }
+        branchOfficeUuid: { type: string, format: uuid }
+        branchOfficeCode: { type: string }
+        branchOfficeName: { type: string }
+        posUuid: { type: string, format: uuid }
+        posName: { type: string }
+        invoiceRequested: { type: boolean }
+        sku: { type: string }
+        productName: { type: string }
+        productType:
+          type: string
+          enum: [product, service]
+        productTypeDescription: { type: string, example: Producto }
+        categoryUuid: { type: string, format: uuid }
+        categoryName: { type: string }
+        currencyId: { type: string, example: mxn }
+        originalSalePrice: { type: number }
+        discountRate: { type: number, nullable: true }
+        salePrice: { type: number }
+        unitPrice: { type: number }
+        unitTax: { type: number }
+        qty: { type: number }
+        unitName: { type: string, example: Pieza }
+        unitAbbr: { type: string, example: pza(s) }
+        saleSubtotal: { type: number }
+        saleTax: { type: number }
+        saleTotal: { type: number }
