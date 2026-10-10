@@ -4,7 +4,7 @@ info:
   title: API de Bizzoft POS
   version: 1.0.0
   license:
-    name: Propietaria
+    name: Licencia propietaria
   description: |
     Acceso programático a Bizzoft POS para integraciones (ERPs, herramientas de BI, robots).
 
@@ -37,7 +37,7 @@ info:
 servers:
   - url: https://services.bizzoft.com/microservices
     description: Producción
-  - url: https://d3bd56kfqrd0eh.cloudfront.net/microservices
+  - url: https://sandbox.bizzoft.com/microservices
     description: QA
 
 tags:
